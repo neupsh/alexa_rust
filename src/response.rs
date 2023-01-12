@@ -2,13 +2,27 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 
-use self::serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt;
+//use std::fmt::Display;
+use std::str::FromStr;
+
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 enum Version {
     V1_0,
 }
+
+// /// use display to serialize a value
+// fn use_display<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         T: Display,
+//         S: Serializer
+// {
+//     serializer.collect_str(value)
+// }
+
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -30,6 +44,7 @@ impl Response {
                 card: None,
                 reprompt: None,
                 should_end_session: should_end,
+                directives: vec![],
             },
         }
     }
@@ -63,9 +78,15 @@ impl Response {
         self
     }
 
+    /// adds a directive to the response
+    pub fn with_directive(mut self, directive: Directive) -> Self {
+        self.body.directives.push(directive);
+        self
+    }
+
     /// adds an attribute key/value pair to the response
     /// attributes can be read on the next request for basic state
-    /// persistance
+    /// persistence
     pub fn add_attribute(&mut self, key: &str, val: &str) {
         if let Some(ref mut h) = self.session_attributes {
             let _ = h.insert(String::from(key), String::from(val));
@@ -99,7 +120,235 @@ pub struct ResBody {
     reprompt: Option<Reprompt>,
     #[serde(rename = "shouldEndSession")]
     should_end_session: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    directives: Vec<Directive>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Directive {
+    AudioPlayer(AudioPlayerDirective),
+}
+
+impl From<AudioPlayerDirective> for Directive {
+    fn from(value: AudioPlayerDirective) -> Self {
+        Self::AudioPlayer(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum DirectiveType {
+    AudioPlayerPlay,
+    AudioPlayerStop,
+    AudioPlayerClearQueue,
+    Other(String),
+}
+
+impl DirectiveType {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "AudioPlayer.Play" => DirectiveType::AudioPlayerPlay,
+            "AudioPlayer.Stop" => DirectiveType::AudioPlayerStop,
+            "AudioPlayer.ClearQueue" => DirectiveType::AudioPlayerClearQueue,
+            _ => DirectiveType::Other(s.to_string()),
+        }
+    }
+}
+
+impl FromStr for DirectiveType {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(DirectiveType::from_str(s))
+    }
+}
+
+impl<'a> From<&'a str> for DirectiveType {
+    fn from(s: &'a str) -> DirectiveType {
+        DirectiveType::from_str(s)
+    }
+}
+
+impl fmt::Display for DirectiveType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = match &*self {
+            DirectiveType::AudioPlayerPlay => "AudioPlayer.Play",
+            DirectiveType::AudioPlayerStop => "AudioPlayer.Stop",
+            DirectiveType::AudioPlayerClearQueue => "AudioPlayer.ClearQueue",
+            DirectiveType::Other(str) => str.as_ref(),
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl<'de> Deserialize<'de> for DirectiveType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where D: Deserializer<'de>
+    {
+        let s = String::deserialize(deserializer)?;
+        FromStr::from_str(&s).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioPlayerDirective {
+    #[serde(rename = "type")]
+    directive_type: DirectiveType,
+    play_behavior: Option<PlayBehavior>,
+    audio_item: Option<AudioItem>,
+}
+
+impl AudioPlayerDirective {
+    pub fn new(directive_type: DirectiveType, play_behavior: PlayBehavior, audio_item: AudioItem) -> Self {
+        AudioPlayerDirective {
+            directive_type,
+            play_behavior: Some(play_behavior),
+            audio_item: Some(audio_item),
+        }
+    }
+
+    pub fn with_directive_type(mut self, dt: DirectiveType) -> Self {
+        self.directive_type = dt;
+        self
+    }
+
+    pub fn with_play_behavior(mut self, pb: PlayBehavior) -> Self {
+        self.play_behavior = Some(pb);
+        self
+    }
+
+    pub fn with_item(mut self, item: AudioItem) -> Self {
+        self.audio_item = Some(item);
+        self
+    }
+
+    /// Adds to the end of the queue
+    pub fn enqueue_item(audio_item: AudioItem) -> Self {
+        AudioPlayerDirective {
+            directive_type: DirectiveType::AudioPlayerPlay,
+            play_behavior: Some(PlayBehavior::Enqueue),
+            audio_item: Some(audio_item),
+        }
+    }
+
+    /// Replaces current one and the rest immediately
+    pub fn replace_with(audio_item: AudioItem) -> Self {
+        AudioPlayerDirective {
+            directive_type: DirectiveType::AudioPlayerPlay,
+            play_behavior: Some(PlayBehavior::ReplaceAll),
+            audio_item: Some(audio_item),
+        }
+    }
+
+    /// Replaces the next one and the rest of the queue with the given one.
+    /// This does not impact the currently playing stream.
+    pub fn play_next(audio_item: AudioItem) -> Self {
+        AudioPlayerDirective {
+            directive_type: DirectiveType::AudioPlayerPlay,
+            play_behavior: Some(PlayBehavior::ReplaceAll),
+            audio_item: Some(audio_item),
+        }
+    }
+
+    pub fn stop_player() -> Self {
+        AudioPlayerDirective {
+            directive_type: DirectiveType::AudioPlayerStop,
+            play_behavior: None,
+            audio_item: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioItem {
+    stream: Stream,
+    metadata: Option<Metadata>,
+}
+
+impl AudioItem {
+    pub fn new(stream: Stream) -> Self {
+        AudioItem { stream, metadata: None }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Stream {
+    url: String,
+    token: Option<String>,
+    expected_previous_token: Option<String>,
+    offset_in_milliseconds: u64,
+    caption_data: Option<CaptionData>,
+}
+
+impl Stream {
+    pub fn new<T: Into<String>>(url: T) -> Self {
+        Stream {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_token<T: Into<String>>(mut self, t: T) -> Self {
+        self.token = Some(t.into());
+        self
+    }
+
+    pub fn with_prev_token<T: Into<String>>(mut self, t: T) -> Self {
+        self.expected_previous_token = Some(t.into());
+        self
+    }
+
+    pub fn with_offset_ms(mut self, offset: u64) -> Self {
+        self.offset_in_milliseconds = offset;
+        self
+    }
+
+    pub fn with_caption(mut self, caption: CaptionData) -> Self {
+        self.caption_data = Some(caption);
+        self
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Metadata {
+    title: Option<String>,
+    subtitle: Option<String>,
+    art: Option<Artwork>,
+    background_image: Option<Artwork>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Artwork {
+    sources: Vec<Source>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Source {
+    url: String,
+}
+
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionData {
+    content: Option<String>,
+    #[serde(rename = "type")]
+    caption_type: Option<String>,
+}
+
+// #[serde(default, rename_all = "camelCase")]
+// #[derive(Serialize, Deserialize, Debug, Clone)]
+// pub struct CaptionData {
+//
+// }
+
 
 enum SpeechType {
     Plain,
@@ -117,9 +366,13 @@ impl fmt::Display for SpeechType {
 }
 
 /// Play behavior for output speech
+#[derive(Debug, Clone, PartialEq)]
 pub enum PlayBehavior {
+    /// Add the specified stream to the end of the current queue. This does not impact the currently playing stream.
     Enqueue,
+    /// Immediately begin playback of the specified stream, and replace current and enqueued streams.
     ReplaceAll,
+    /// Replace all streams in the queue. This does not impact the currently playing stream.
     ReplaceEnqueued,
 }
 
@@ -131,6 +384,36 @@ impl fmt::Display for PlayBehavior {
             PlayBehavior::ReplaceEnqueued => "REPLACE_ENQUEUED",
         };
         write!(f, "{}", s)
+    }
+}
+
+impl FromStr for PlayBehavior {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let pb = match s {
+            "ENQUEUE" => PlayBehavior::Enqueue,
+            "REPLACE_ALL" => PlayBehavior::ReplaceAll,
+            "REPLACE_ENQUEUED" => PlayBehavior::ReplaceEnqueued,
+            _ => PlayBehavior::Enqueue,
+        };
+        Ok(pb)
+    }
+}
+
+impl Serialize for PlayBehavior {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where S: Serializer {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PlayBehavior {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where D: Deserializer<'de>
+    {
+        let s = String::deserialize(deserializer)?;
+        FromStr::from_str(&s).map_err(de::Error::custom)
     }
 }
 
@@ -410,4 +693,27 @@ mod tests {
         let r = Response::simple("foo", "bar");
         assert_eq!(r.body.should_end_session, true);
     }
+
+    #[test]
+    fn test_ap_directive() {
+        let s = r#"
+        {
+        "type": "AudioPlayer.Play",
+        "playBehavior": "ENQUEUE",
+        "audioItem": {
+          "stream": {
+            "token": "this-is-the-audio-token",
+            "url": "https://my-audio-hosting-site.com/audio/sample-song.mp3",
+            "offsetInMilliseconds": 0
+          }
+        }
+      }"#;
+        let directive: Result<Directive, _> = serde_json::from_str(s);
+        assert!(directive.is_ok());
+        let directive = directive.unwrap();
+        assert!(matches!(directive, Directive::AudioPlayer{..}));
+    }
+
+    #[test]
+    fn test_audio_play_response() {}
 }
